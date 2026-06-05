@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>PDF Content Extractor</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+  <header class="toolbar">
+    <span class="app-title">PDF Content Extractor</span>
+    <label class="file-label" for="pdfInput">
+      Choose PDF
+      <input type="file" id="pdfInput" accept=".pdf" hidden />
+    </label>
+    <button id="uploadBtn" disabled>Extract</button>
+    <span id="statusMsg" class="status"></span>
+  </header>
+
+  <main class="panels">
+    <!-- Left: PDF viewer -->
+    <section class="panel pdf-panel">
+      <div class="panel-header">Original PDF</div>
+      <div class="panel-body" id="pdfViewerWrap">
+        <div class="placeholder">Select a PDF to preview it here.</div>
+      </div>
+    </section>
+
+    <!-- Centre: resizable divider + sync scrollbar -->
+    <div class="center-bar" id="centerBar">
+      <div class="divider" id="divider"></div>
+      <div class="sync-track" id="syncTrack">
+        <div class="sync-thumb" id="syncThumb"></div>
+      </div>
+    </div>
+
+    <!-- Right: HTML preview -->
+    <section class="panel preview-panel">
+      <div class="panel-header">Extracted HTML View</div>
+      <div class="panel-body preview-body" id="htmlPreview">
+        <div class="placeholder">Extracted content will appear here.</div>
+      </div>
+    </section>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
