@@ -52,15 +52,15 @@ def _is_right(x0, x1, pw):
 
 
 def _font_flags(name: str) -> tuple[bool, bool]:
-    """Detect bold/italic from font name (per PDF-to-EPUB skill guidance).
-
-    Italic is detected by font-name keywords because PDFs often encode italics
-    via the font name rather than a semantic italic flag.
-    """
+    """Detect bold/italic from font name (per PDF-to-EPUB skill guidance)."""
     n = name.lower()
     bold = (
-        "bold" in n or ",b" in n or "-bd" in n
-        or "demi" in n or "heavy" in n or "black" in n
+        "bold"      in n or ",b"    in n or "-bd"   in n
+        or "demi"   in n or "heavy" in n or "black" in n
+        or "semibold" in n or "extrabold" in n or "ultrabold" in n
+        or "medium" in n   # some fonts use medium as their "bold" weight
+        or n.endswith("-w6") or n.endswith("-w7")
+        or n.endswith("-w8") or n.endswith("-w9")
     )
     italic = (
         "italic" in n or "oblique" in n or "slanted" in n
@@ -70,10 +70,31 @@ def _font_flags(name: str) -> tuple[bool, bool]:
     return bold, italic
 
 
+def _extract_hr_lines(page: "fitz.Page", pw_pt: float) -> list[dict]:
+    """Return horizontal rule items from vector drawings on the page.
+
+    A horizontal rule is a path whose bounding rect is:
+    - Very thin  (height < 4 pt)
+    - Wide enough to be a visible separator (width > 25 % of page width)
+    """
+    hr_items: list[dict] = []
+    try:
+        for path in page.get_drawings():
+            r = path.get("rect")
+            if r is None:
+                continue
+            if r.height < 4 and r.width > pw_pt * 0.25:
+                hr_items.append({"type": "hr", "y": float(r.y0)})
+    except Exception:
+        pass
+    return hr_items
+
+
 def _span_html(text: str, font: str, size_pt: float,
                r: int, g: int, b: int,
                bold: bool, italic: bool,
-               include_size: bool = True) -> str:
+               include_size: bool = True,
+               strikethrough: bool = False) -> str:
     """Return a single semantic HTML span for one PDF text run.
 
     Per pdf-to-epub skill:
@@ -96,6 +117,10 @@ def _span_html(text: str, font: str, size_pt: float,
         inner = f"<em>{safe}</em>"
     else:
         inner = safe
+
+    # Strikethrough wraps the decorated content
+    if strikethrough:
+        inner = f"<del>{inner}</del>"
 
     # Outer <span> carries font-family and colour (and size for body text)
     parts = [f"font-family:'{font}',serif", f"color:rgb({r},{g},{b})"]
@@ -312,100 +337,106 @@ def _build_page_parts(page, pw_pt, scale, img_blks, txt_blks, page_area):
 
     body_sz = _body_font_size(txt_blks)
 
-    # ── Page metrics ──────────────────────────────────────────────────────
-    all_lns = [ln for blk in txt_blks for ln in blk.get("lines", [])]
-    heights  = sorted(l["bbox"][3]-l["bbox"][1]
-                      for l in all_lns if l["bbox"][3] > l["bbox"][1])
-    median_h = heights[len(heights)//2] if heights else 10
-
-    # Gap threshold: blocks closer than this → candidate for merging
-    merge_thresh = median_h * 0.6
-
-    # Right margin: the maximum x1 seen across all text lines on this page.
-    # Used to detect "short last lines" that signal a paragraph boundary.
+    # ── Page right margin (for short-line detection within blocks) ────────
     right_margin = max(
-        (ln["bbox"][2]
-         for blk in txt_blks
-         for ln in blk.get("lines", [])),
-        default=pw_pt * 0.85
+        (ln["bbox"][2] for blk in txt_blks for ln in blk.get("lines", [])),
+        default=pw_pt * 0.85,
     )
-    # A line ending more than 5 % of the right margin before the right edge
-    # is "short" — it is the final line of its paragraph (justified body
-    # text fills the full width on every line EXCEPT the last one).
-    # Using a percentage makes this work for any page/font size.
-    # Minimum of 10 pt to avoid hair-trigger on very narrow pages.
-    short_thresh = right_margin - max(right_margin * 0.05, 10)
 
-    # ── Walk blocks in reading order ──────────────────────────────────────
+    # ── Strikethrough lines from vector drawings ──────────────────────────
+    # Strikethrough is drawn as a short horizontal line over the text span.
+    # Separator rules are full-width; strikethrough lines are narrow.
+    strike_lines: list = []
+    try:
+        for path in page.get_drawings():
+            r = path.get("rect")
+            if r and r.height < 4 and 0 < r.width < pw_pt * 0.75:
+                strike_lines.append(r)
+    except Exception:
+        pass
+
+    def _is_struck(span_bbox) -> bool:
+        """True if a drawing line passes through this span at its midpoint."""
+        sx0, sy0, sx1, sy1 = span_bbox
+        mid_y = (sy0 + sy1) / 2
+        for sr in strike_lines:
+            h_overlap = sr.x0 <= sx1 - 2 and sr.x1 >= sx0 + 2
+            v_overlap  = sr.y0 - 4 <= mid_y <= sr.y1 + 4
+            if h_overlap and v_overlap:
+                return True
+        return False
+
+    # ── Sort blocks top→bottom ────────────────────────────────────────────
     sorted_blks = sorted(txt_blks,
                          key=lambda b: (round(b["bbox"][1]/2)*2, b["bbox"][0]))
-    items:     list[dict] = []
-    cur_lines: list[dict] = []   # lines accumulating for current paragraph
-    cur_bottom: float     = 0
-    prev_was_short: bool  = False  # was the last line in cur_lines "short"?
 
-    # ── Flatten blocks → individual lines, preserving TOC blocks intact ─────
-    # Process EVERY LINE individually so the short-line heuristic works even
-    # when multiple "short" lines live inside the same PyMuPDF block (e.g.
-    # a list of book titles where each title is its own paragraph).
+    # ── Deduplicate overlapping blocks ────────────────────────────────────
+    # Some PDFs (layered ebooks) place identical text at the same y-position
+    # multiple times.  Keep only the first block at each unique y-top.
+    seen_y: set[int] = set()
+    deduped: list[dict] = []
+    for blk in sorted_blks:
+        y_key = round(blk["bbox"][1])
+        if y_key not in seen_y:
+            seen_y.add(y_key)
+            deduped.append(blk)
+    sorted_blks = deduped
+
+    # ── One PyMuPDF block = one paragraph (NO merging, NO splitting) ──────
+    # PyMuPDF already determined which lines belong together (same block)
+    # and which are separate (different blocks).  We trust that completely.
+    # Lines within a block are joined with a space; different blocks get
+    # their own <p>.  This is the most faithful representation of the PDF.
+    items: list[dict] = []
 
     for blk in sorted_blks:
         bx0, by0, bx1, by1 = blk["bbox"]
 
-        # Skip text inside an image block (already drawn as pixels)
+        # Skip text already drawn inside an image block
         if any(
             ix0 <= bx0 and iy0 <= by0 and ix1 >= bx1 and iy1 >= by1
             for ix0, iy0, ix1, iy1 in (b["bbox"] for b in img_blks)
         ):
             continue
 
-        # TOC / standalone block → flush current paragraph, add as toc item
+        # TOC entry (tab-leader / right-aligned page number) → toc item
         if _is_standalone_block(blk, pw_pt):
-            if cur_lines:
-                items.append({"type": "para",
-                               "y": cur_lines[0]["bbox"][1],
-                               "lines": cur_lines})
-                cur_lines = []
             items.append({"type": "toc", "y": by0, "blk": blk, "pw_pt": pw_pt})
-            cur_bottom     = by1
-            prev_was_short = False
             continue
 
-        # Process every line in this block individually
-        for ln in sorted(blk.get("lines", []), key=lambda l: l["bbox"][1]):
-            ln_dict = {"spans": ln.get("spans", []),
-                       "bbox":  ln["bbox"],
-                       "bx0": bx0, "bx1": bx1}
-            ly0, ly1 = ln["bbox"][1], ln["bbox"][3]
-            lx1      = ln["bbox"][2]
-            gap      = ly0 - cur_bottom
+        # Regular text block → one paragraph per block, BUT split at
+        # first-line-indent boundaries within the block.
+        #
+        # Signal: a line is "short" (ends well before the right margin)
+        # AND the next line is "indented" (starts further right than the
+        # block's own left edge).  This is the universal typography cue
+        # for a paragraph break in justified body text.
+        raw = sorted(blk.get("lines", []), key=lambda l: l["bbox"][1])
+        indent_min = max(right_margin * 0.025, 6)   # ~2.5 % of page width
 
-            # Start a new paragraph when:
-            #  1. Nothing accumulated yet
-            #  2. Gap from previous line is large (actual blank line)
-            #  3. Previous line was short (last line of a paragraph)
-            start_new = (
-                not cur_lines
-                or gap > merge_thresh
-                or prev_was_short
-            )
+        current_group: list[dict] = []
+        for i, ln in enumerate(raw):
+            ld = {"spans": ln.get("spans", []),
+                  "bbox":  ln["bbox"],
+                  "bx0": bx0, "bx1": bx1}
+            current_group.append(ld)
 
-            if start_new:
-                if cur_lines:
-                    items.append({"type": "para",
-                                   "y": cur_lines[0]["bbox"][1],
-                                   "lines": cur_lines})
-                cur_lines = [ln_dict]
-            else:
-                cur_lines.append(ln_dict)
+            if i < len(raw) - 1:
+                nxt      = raw[i + 1]
+                is_short    = ln["bbox"][2]   < right_margin * 0.85
+                is_indented = nxt["bbox"][0]  > bx0 + indent_min
+                if is_short and is_indented:
+                    items.append({"type": "para", "y": current_group[0]["bbox"][1],
+                                  "lines": current_group})
+                    current_group = []
 
-            prev_was_short = lx1 < short_thresh
-            cur_bottom     = ly1
+        if current_group:
+            items.append({"type": "para", "y": current_group[0]["bbox"][1],
+                          "lines": current_group})
 
-    if cur_lines:
-        items.append({"type": "para",
-                       "y": cur_lines[0]["bbox"][1],
-                       "lines": cur_lines})
+    # ── Horizontal rules from vector drawings ─────────────────────────────
+    for hr in _extract_hr_lines(page, pw_pt):
+        items.append(hr)
 
     # ── Images ────────────────────────────────────────────────────────────
     for blk in img_blks:
@@ -456,6 +487,15 @@ def _build_page_parts(page, pw_pt, scale, img_blks, txt_blks, page_area):
             )
             continue
 
+        # ── Horizontal rule ───────────────────────────────────────────────
+        if item["type"] == "hr":
+            parts.append(
+                '<hr contenteditable="false" '
+                'style="border:none;border-top:1px solid #333;'
+                'margin:0.6em 0;"/>'
+            )
+            continue
+
         # ── TOC entry ─────────────────────────────────────────────────────
         if item["type"] == "toc":
             html_row = _render_toc_entry(item["blk"])
@@ -503,6 +543,7 @@ def _build_page_parts(page, pw_pt, scale, img_blks, txt_blks, page_area):
                     "r": (c>>16)&0xFF, "g": (c>>8)&0xFF, "b": c&0xFF,
                     "bold":   bold,
                     "italic": italic,
+                    "bbox":   sp["bbox"],   # needed for strikethrough detection
                 })
             # Paragraph line separator (flow layout — joins with space)
             if raw_spans and not raw_spans[-1]["text"].endswith(" "):
@@ -529,7 +570,8 @@ def _build_page_parts(page, pw_pt, scale, img_blks, txt_blks, page_area):
             _span_html(s["text"], s["font"], s["size"],
                        s["r"], s["g"], s["b"],
                        s["bold"], s["italic"],
-                       include_size=(htag is None))
+                       include_size=(htag is None),
+                       strikethrough=_is_struck(s["bbox"]))
             for s in merged
             if s["text"].strip()
         )
