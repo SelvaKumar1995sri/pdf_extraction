@@ -15,6 +15,18 @@
       <input type="file" id="pdfInput" accept=".pdf" hidden />
     </label>
     <button id="uploadBtn" disabled>Extract</button>
+    <button id="debugBtn"  disabled>🔍 Debug Raw</button>
+
+    <!-- Download dropdown (shown after extraction) -->
+    <div class="dl-wrap" id="dlWrap" style="display:none;">
+      <button class="dl-toggle" id="dlToggle">⬇ Download ▾</button>
+      <div class="dl-menu" id="dlMenu">
+        <button data-fmt="html">📄 HTML</button>
+        <button data-fmt="docx">📝 DOCX</button>
+        <button data-fmt="epub">📚 EPUB</button>
+      </div>
+    </div>
+
     <span id="statusMsg" class="status"></span>
   </header>
 

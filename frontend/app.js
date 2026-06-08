@@ -2,7 +2,13 @@ const API_BASE = "http://localhost:8000";
 
 const pdfInput    = document.getElementById("pdfInput");
 const uploadBtn   = document.getElementById("uploadBtn");
+const debugBtn    = document.getElementById("debugBtn");
+const dlWrap      = document.getElementById("dlWrap");
+const dlToggle    = document.getElementById("dlToggle");
+const dlMenu      = document.getElementById("dlMenu");
 const statusMsg   = document.getElementById("statusMsg");
+
+let extractedHtml = "";   // stored after each successful extraction
 const pdfWrap     = document.getElementById("pdfViewerWrap");
 const htmlPreview = document.getElementById("htmlPreview");
 const divider     = document.getElementById("divider");
@@ -21,6 +27,7 @@ pdfInput.addEventListener("change", () => {
   if (!file) return;
   selectedFile = file;
   uploadBtn.disabled = false;
+  debugBtn.disabled  = false;
   setStatus(`Selected: ${file.name}`);
   if (objectUrl) URL.revokeObjectURL(objectUrl);
   objectUrl = URL.createObjectURL(file);
@@ -50,14 +57,88 @@ uploadBtn.addEventListener("click", async () => {
     }
     const data = await res.json();
     htmlPreview.innerHTML = data.html;
+    extractedHtml = data.html;          // store for download
     totalPages = data.pages || 1;
     setStatus("Done.");
+    dlWrap.style.display = "";          // show download button
     setTimeout(refreshThumb, 150);
+    initImageInteraction();
   } catch (err) {
     htmlPreview.innerHTML = `<div class="placeholder" style="color:#c0392b">Error: ${escHtml(err.message)}</div>`;
     setStatus(`Error: ${err.message}`, true);
   } finally {
     uploadBtn.disabled = false;
+  }
+});
+
+// ── Download dropdown ────────────────────────────────────────────────────────
+dlToggle.addEventListener("click", e => {
+  e.stopPropagation();
+  dlMenu.classList.toggle("open");
+});
+document.addEventListener("click", () => dlMenu.classList.remove("open"));
+
+dlMenu.querySelectorAll("button[data-fmt]").forEach(btn => {
+  btn.addEventListener("click", async () => {
+    dlMenu.classList.remove("open");
+    const fmt = btn.dataset.fmt;
+    if (!extractedHtml) { setStatus("Nothing extracted yet.", true); return; }
+
+    const title  = selectedFile ? selectedFile.name.replace(/\.pdf$/i, "") : "Extracted Book";
+    setStatus(`Preparing ${fmt.toUpperCase()}…`);
+
+    try {
+      const res = await fetch(`${API_BASE}/download/${fmt}`, {
+        method:  "POST",
+        headers: { "Content-Type": "application/json" },
+        body:    JSON.stringify({ html: extractedHtml, title }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ detail: res.statusText }));
+        throw new Error(err.detail || "Server error");
+      }
+      const blob     = await res.blob();
+      const url      = URL.createObjectURL(blob);
+      const anchor   = document.createElement("a");
+      anchor.href     = url;
+      anchor.download = `${title}.${fmt}`;
+      anchor.click();
+      URL.revokeObjectURL(url);
+      setStatus(`${fmt.toUpperCase()} downloaded.`);
+    } catch (err) {
+      setStatus(`Download failed: ${err.message}`, true);
+    }
+  });
+});
+
+// ── Debug button — opens raw extraction in a new tab ────────────────────────
+debugBtn.addEventListener("click", async () => {
+  if (!selectedFile) return;
+  // Ask which page to debug (default = current PDF page shown, fallback 0)
+  const pageInput = prompt(
+    `Debug raw extraction.\nEnter page number (1-based):`,
+    String(currentPage || 1)
+  );
+  if (pageInput === null) return;                 // cancelled
+  const pageIdx = Math.max(0, parseInt(pageInput, 10) - 1) || 0;
+
+  debugBtn.disabled = true;
+  setStatus("Loading debug view…");
+  try {
+    const fd = new FormData();
+    fd.append("file", selectedFile);
+    const res  = await fetch(`${API_BASE}/debug?page=${pageIdx}`,
+                             { method: "POST", body: fd });
+    const html = await res.text();
+    // Open result in a new tab
+    const blob = new Blob([html], { type: "text/html" });
+    const url  = URL.createObjectURL(blob);
+    window.open(url, "_blank");
+    setStatus("Debug view opened in new tab.");
+  } catch (err) {
+    setStatus(`Debug error: ${err.message}`, true);
+  } finally {
+    debugBtn.disabled = false;
   }
 });
 
@@ -222,3 +303,213 @@ syncTrack.addEventListener("click", e => {
 
 // ── Refresh thumb on window resize ─────────────────────────────────────────
 window.addEventListener("resize", refreshThumb);
+
+// ── Image interaction ─────────────────────────────────────────────────────────
+// Click        → select (purple ring + Delete toolbar)
+// Drag         → pointer-event drag (works inside contenteditable)
+// Delete key   → remove selected image
+// Ctrl + Z     → restore last deleted image
+
+// Unified undo stack — records both moves and deletes
+// Each entry: { type: 'move'|'delete', div, parent, nextSibling }
+const actionStack = [];
+let   ptrDiv      = null;        // image being dragged
+let   ptrGhost    = null;        // ghost clone following cursor
+let   ptrOffX     = 0;
+let   ptrOffY     = 0;
+let   dropLine    = null;        // purple line showing insertion point
+let   dropInfo    = null;        // {parent, beforeEl} — resolved on mouseup
+
+function initImageInteraction() { /* handlers are delegated — nothing per-block needed */ }
+
+// ── Delegated mousedown ───────────────────────────────────────────────────────
+htmlPreview.addEventListener("mousedown", e => {
+  if (e.target.closest(".img-toolbar")) return;   // let toolbar buttons fire
+
+  const block = e.target.closest(".pdf-img-block");
+  if (!block) { clearImageSelection(); return; }
+
+  e.preventDefault();   // stops contenteditable node-selection
+
+  if (block.classList.contains("img-selected")) {
+    // Second click on already-selected → start drag
+    _startPointerDrag(block, e);
+  } else {
+    clearImageSelection();
+    _selectImage(block);
+  }
+});
+
+// ── Select ────────────────────────────────────────────────────────────────────
+function _selectImage(div) {
+  clearImageSelection();
+  div.classList.add("img-selected");
+
+  const bar = document.createElement("div");
+  bar.className = "img-toolbar";
+  bar.innerHTML = `<button class="btn-delete">🗑 Delete</button>`;
+
+  bar.querySelector(".btn-delete").addEventListener("mousedown", ev => {
+    ev.stopPropagation();
+    _deleteImage(div);
+  });
+  div.appendChild(bar);
+}
+
+function clearImageSelection() {
+  htmlPreview.querySelectorAll(".pdf-img-block.img-selected").forEach(d => {
+    d.classList.remove("img-selected");
+    d.querySelector(".img-toolbar")?.remove();
+  });
+}
+
+// ── Delete — push to undo stack ───────────────────────────────────────────────
+function _deleteImage(div) {
+  actionStack.push({ type: 'delete', div, parent: div.parentNode, nextSibling: div.nextSibling });
+  div.remove();
+}
+
+// ── Pointer-event drag ────────────────────────────────────────────────────────
+function _startPointerDrag(div, e) {
+  ptrDiv  = div;
+  const r = div.getBoundingClientRect();
+  ptrOffX = e.clientX - r.left;
+  ptrOffY = e.clientY - r.top;
+
+  // Ghost: scaled-down copy of the image
+  ptrGhost = document.createElement("div");
+  ptrGhost.className = "img-ghost";
+  const img = div.querySelector("img");
+  if (img) {
+    const gi = img.cloneNode(true);
+    gi.style.cssText = "max-width:180px;height:auto;display:block;";
+    ptrGhost.appendChild(gi);
+  }
+  document.body.appendChild(ptrGhost);
+
+  // Drop indicator line
+  dropLine = document.createElement("div");
+  dropLine.className = "img-drop-line";
+  htmlPreview.appendChild(dropLine);
+
+  div.style.opacity = "0.2";
+  div.querySelector(".img-toolbar")?.remove();
+  div.classList.remove("img-selected");
+
+  document.addEventListener("mousemove", _onPtrMove);
+  document.addEventListener("mouseup",   _onPtrUp,   { once: true });
+}
+
+function _onPtrMove(e) {
+  // Move ghost
+  ptrGhost.style.left = (e.clientX - ptrOffX) + "px";
+  ptrGhost.style.top  = (e.clientY - ptrOffY) + "px";
+
+  // Resolve insertion point
+  dropInfo = _resolveInsert(e.clientX, e.clientY);
+
+  if (dropInfo) {
+    const pr   = htmlPreview.getBoundingClientRect();
+    const refEl = dropInfo.beforeEl || dropInfo.parent.lastElementChild;
+    const lineY = dropInfo.beforeEl
+      ? dropInfo.beforeEl.getBoundingClientRect().top  - pr.top + htmlPreview.scrollTop - 2
+      : (refEl ? refEl.getBoundingClientRect().bottom - pr.top + htmlPreview.scrollTop + 2 : 0);
+
+    dropLine.style.display = "block";
+    dropLine.style.top     = lineY + "px";
+  } else {
+    dropLine.style.display = "none";
+  }
+}
+
+function _onPtrUp(e) {
+  document.removeEventListener("mousemove", _onPtrMove);
+
+  ptrGhost?.remove();  ptrGhost = null;
+  dropLine?.remove();  dropLine = null;
+
+  if (ptrDiv) {
+    ptrDiv.style.opacity = "";
+
+    if (dropInfo) {
+      // Record the CURRENT position before moving (for undo)
+      const prevParent = ptrDiv.parentNode;
+      const prevNext   = ptrDiv.nextSibling;
+      const moved      = dropInfo.parent !== prevParent || dropInfo.beforeEl !== ptrDiv.nextSibling;
+
+      if (moved) {
+        dropInfo.parent.insertBefore(ptrDiv, dropInfo.beforeEl);
+        actionStack.push({
+          type:        'move',
+          div:         ptrDiv,
+          parent:      prevParent,
+          nextSibling: prevNext
+        });
+      }
+    }
+
+    _selectImage(ptrDiv);
+    ptrDiv = null;
+  }
+  dropInfo = null;
+}
+
+// Find which {parent, beforeEl} best matches cursor (x, y)
+function _resolveInsert(cx, cy) {
+  let best = null, bestDist = Infinity;
+
+  htmlPreview.querySelectorAll("[contenteditable='true']").forEach(page => {
+    const kids = [...page.children];
+    // Check gap before each child + after last
+    for (let i = 0; i <= kids.length; i++) {
+      if (kids[i] === ptrDiv) continue;
+
+      let lineY;
+      if (i === 0) {
+        lineY = page.getBoundingClientRect().top;
+      } else {
+        const prev = kids[i - 1];
+        if (prev === ptrDiv) continue;
+        lineY = prev.getBoundingClientRect().bottom;
+      }
+
+      const dist = Math.abs(cy - lineY);
+      if (dist < bestDist) {
+        bestDist = dist;
+        best = { parent: page, beforeEl: kids[i] ?? null };
+      }
+    }
+  });
+  return best;
+}
+
+// ── Keyboard shortcuts ────────────────────────────────────────────────────────
+document.addEventListener("keydown", e => {
+  // Ctrl + Z → undo last move or delete
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z") {
+    const last = actionStack.pop();
+    if (last) {
+      e.preventDefault();
+      const { div, parent, nextSibling } = last;
+      // Restore to recorded position
+      if (nextSibling && parent.contains(nextSibling)) {
+        parent.insertBefore(div, nextSibling);
+      } else {
+        parent.appendChild(div);
+      }
+      _selectImage(div);
+      div.scrollIntoView({ block: "nearest" });
+    }
+    return;
+  }
+
+  // Delete / Backspace key → remove selected image
+  const sel = htmlPreview.querySelector(".pdf-img-block.img-selected");
+  if (sel && (e.key === "Delete" || e.key === "Backspace")) {
+    // Only if focus is not inside a text span
+    const active = document.activeElement;
+    if (!active || active === document.body || active === htmlPreview) {
+      _deleteImage(sel);
+    }
+  }
+});

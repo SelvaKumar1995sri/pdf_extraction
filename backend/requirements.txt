@@ -3,3 +3,7 @@ uvicorn[standard]
 PyMuPDF
 Pillow
 python-multipart
+python-docx
+EbookLib
+beautifulsoup4
+lxml

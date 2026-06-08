@@ -1,70 +1,44 @@
 import base64
 import re
+from collections import Counter
 
 import fitz  # PyMuPDF
 
-RENDER_WIDTH   = 794   # A4 width  at 96 DPI  (210 mm)
-A4_MIN_H       = 1123  # A4 height at 96 DPI  (297 mm)
-MIN_IMG_PT     = 4
+RENDER_WIDTH   = 780    # max content width in px
 MULTI_IMG_ZOOM = 1.5
+MIN_IMG_PT     = 4
 
 
 # ── PUA character fix ─────────────────────────────────────────────────────────
 
 def _fix_pua(text: str) -> str:
-    """Recover real characters from PyMuPDF's PUA fallback encoding.
-
-    When a PDF font has no ToUnicode entry for a glyph, PyMuPDF maps the raw
-    character code `c` to  U+E000 + c.
-
-    GambadoSans (and similar display fonts) store character codes as
-    ASCII + 18, so  PUA = U+E000 + ASCII + 18 = U+E012 + ASCII.
-    To recover:  ASCII = PUA − 0xE012
-
-    Evidence from the current PDF:
-        ] (0x5D) − 18 = 0x4B = K   ✓
-        □ (0x84) − 18 = 0x72 = r   ✓   (0x84 was > 0x7E, blocked before)
-        { (0x7B) − 18 = 0x69 = i   ✓
-        v (0x76) − 18 = 0x64 = d   ✓
-        S (0x53) − 18 = 0x41 = A   ✓
-    """
+    """Map PyMuPDF PUA fallback chars (U+E012+ASCII) back to real ASCII."""
     out = []
     for ch in text:
         cp = ord(ch)
         if 0xE000 <= cp <= 0xF8FF:
-            corrected = cp - 0xE012          # subtract 0xE000 + 18
+            corrected = cp - 0xE012
             if 0x20 <= corrected <= 0x7E:
-                out.append(chr(corrected))   # valid printable ASCII
-            # else: drop the unrenderable glyph
+                out.append(chr(corrected))
         else:
             out.append(ch)
     return "".join(out)
 
 
-# ── Font CSS extraction ───────────────────────────────────────────────────────
+# ── Font CSS ──────────────────────────────────────────────────────────────────
 
 def _get_font_css(page: fitz.Page) -> str:
-    """Return the raw content of the <style> block from PyMuPDF's HTML output.
-
-    PyMuPDF embeds every font used on the page as a base64 @font-face rule.
-    Those rules map PUA code points → real glyphs, so headings like
-    'On Kirrin Island Again' render correctly as text in the browser.
-
-    IMPORTANT: this CSS must be placed OUTSIDE any contenteditable element.
-    Browsers silently ignore <style> tags that live inside editable regions.
-    """
     try:
-        html = page.get_text(
-            "html",
-            flags=fitz.TEXT_PRESERVE_WHITESPACE | fitz.TEXT_MEDIABOX_CLIP,
-        )
+        html = page.get_text("html",
+                             flags=fitz.TEXT_PRESERVE_WHITESPACE
+                                   | fitz.TEXT_MEDIABOX_CLIP)
         m = re.search(r"<style>(.*?)</style>", html, re.DOTALL)
         return m.group(1).strip() if m else ""
     except Exception:
         return ""
 
 
-# ── Alignment helpers ─────────────────────────────────────────────────────────
+# ── Alignment ─────────────────────────────────────────────────────────────────
 
 def _is_centered(x0, x1, pw):
     ml, mr = x0, pw - x1
@@ -77,11 +51,58 @@ def _is_right(x0, x1, pw):
     return (pw - x1) < pw * 0.06 and x0 > pw * 0.35
 
 
-def _font_flags(name):
+def _font_flags(name: str) -> tuple[bool, bool]:
+    """Detect bold/italic from font name (per PDF-to-EPUB skill guidance).
+
+    Italic is detected by font-name keywords because PDFs often encode italics
+    via the font name rather than a semantic italic flag.
+    """
     n = name.lower()
-    bold   = "bold" in n or ",b" in n or "-bd" in n or "demi" in n or "heavy" in n
-    italic = "italic" in n or "oblique" in n or ",i" in n
+    bold = (
+        "bold" in n or ",b" in n or "-bd" in n
+        or "demi" in n or "heavy" in n or "black" in n
+    )
+    italic = (
+        "italic" in n or "oblique" in n or "slanted" in n
+        or n.endswith("-it") or n.endswith("-ital")
+        or ",i" in n or "-it," in n
+    )
     return bold, italic
+
+
+def _span_html(text: str, font: str, size_pt: float,
+               r: int, g: int, b: int,
+               bold: bool, italic: bool,
+               include_size: bool = True) -> str:
+    """Return a single semantic HTML span for one PDF text run.
+
+    Per pdf-to-epub skill:
+    - Bold  → <strong>
+    - Italic → <em>
+    - Bold+Italic → <strong><em>
+    - Plain → bare text inside <span>
+    No redundant wrapping; font/size/color in the outer <span> style.
+    """
+    safe = (text.replace("&", "&amp;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;"))
+
+    # Semantic wrappers first
+    if bold and italic:
+        inner = f"<strong><em>{safe}</em></strong>"
+    elif bold:
+        inner = f"<strong>{safe}</strong>"
+    elif italic:
+        inner = f"<em>{safe}</em>"
+    else:
+        inner = safe
+
+    # Outer <span> carries font-family and colour (and size for body text)
+    parts = [f"font-family:'{font}',serif", f"color:rgb({r},{g},{b})"]
+    if include_size:
+        parts.append(f"font-size:{size_pt:.1f}pt")
+    style = ";".join(parts)
+    return f'<span style="{style}">{inner}</span>'
 
 
 # ── Image helpers ─────────────────────────────────────────────────────────────
@@ -93,21 +114,21 @@ def _render_full_page(page, scale):
     return base64.b64encode(pix.tobytes("png")).decode()
 
 
-def _render_region(page, rect, zoom=None):
+def _render_region(page, rect):
     try:
         if rect.width < MIN_IMG_PT or rect.height < MIN_IMG_PT:
             return None
-        if zoom is None:
-            zoom = min(200.0 / min(rect.width, rect.height), 4.0)
-            zoom = max(zoom, 1.0)
-        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom),
-                              clip=rect, alpha=False, colorspace=fitz.csRGB)
+        zoom = min(200.0 / min(rect.width, rect.height), 4.0)
+        zoom = max(zoom, 1.0)
+        pix  = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom),
+                               clip=rect, alpha=False, colorspace=fitz.csRGB)
         return base64.b64encode(pix.tobytes("png")).decode()
     except Exception:
         return None
 
 
 def _overlaps_text(img_bbox, txt_blks, threshold=0.05):
+    """True if img bbox overlaps any single text block by > threshold of img area."""
     ix0, iy0, ix1, iy1 = img_bbox
     img_area = (ix1-ix0)*(iy1-iy0)
     if img_area <= 0:
@@ -121,92 +142,400 @@ def _overlaps_text(img_bbox, txt_blks, threshold=0.05):
     return False
 
 
+def _covers_text_area(img_bbox, txt_blks, coverage=0.30):
+    """True if the image bbox contains more than `coverage` fraction of the
+    total text area on the page.  Catches large background / template images
+    whose individual overlap with each text block is small but whose total
+    footprint swallows most of the text — these must be filtered or the same
+    content appears as both a rendered image AND editable text.
+    """
+    ix0, iy0, ix1, iy1 = img_bbox
+    total_text = sum(
+        (b["bbox"][2]-b["bbox"][0]) * (b["bbox"][3]-b["bbox"][1])
+        for b in txt_blks
+    )
+    if total_text <= 0:
+        return False
+    contained = 0.0
+    for tb in txt_blks:
+        tx0, ty0, tx1, ty1 = tb["bbox"]
+        ox = max(0.0, min(ix1,tx1)-max(ix0,tx0))
+        oy = max(0.0, min(iy1,ty1)-max(iy0,ty0))
+        contained += ox * oy
+    return contained / total_text > coverage
+
+
+# ── Heading detection ─────────────────────────────────────────────────────────
+
+def _body_font_size(txt_blks: list) -> float:
+    """Return the dominant body-text font size, weighted by character count.
+
+    Weighting by character count prevents short noise elements (page numbers,
+    running headers) from skewing the result.  Only spans with ≥ 4 characters
+    are considered so single-digit page numbers are ignored.
+    """
+    size_chars: dict[float, int] = {}
+    for blk in txt_blks:
+        for ln in blk.get("lines", []):
+            for sp in ln.get("spans", []):
+                text = sp["text"].strip()
+                if len(text) < 4:          # skip page numbers, short labels
+                    continue
+                sz = round(sp["size"] * 2) / 2   # bucket to nearest 0.5pt
+                size_chars[sz] = size_chars.get(sz, 0) + len(text)
+    return max(size_chars, key=size_chars.get) if size_chars else 12.0
+
+
+def _heading_tag(para_max_sz: float, body_size: float,
+                 n_lines: int) -> str | None:
+    """Return h1/h2/h3 only when confident this is a real heading.
+
+    Requirements (all must be true):
+    • Single-line block  — multi-line blocks are body paragraphs, not headings
+    • Font ratio ≥ 1.5  — conservative threshold to avoid false positives
+                          when body_size is slightly underestimated
+    """
+    if n_lines != 1:          # multi-line = paragraph, not heading
+        return None
+    if body_size <= 0:
+        return None
+    ratio = para_max_sz / body_size
+    if ratio >= 2.0:  return "h1"
+    if ratio >= 1.5:  return "h2"
+    return None
+
+
 # ── Page content builder ──────────────────────────────────────────────────────
 
-def _build_page_parts(page, pw_pt, scale, img_blks, txt_blks, page_area):
-    """Build the HTML content (images + text) for one page.
+def _is_standalone_block(blk, pw_pt: float) -> bool:
+    """True if this block must NOT be merged with adjacent blocks.
 
-    Text spans use  font-family:'<PDF font name>'  which exactly matches the
-    @font-face family names collected separately and injected at the top of the
-    full HTML output (outside all contenteditable divs).
-    PUA characters are kept as-is — the @font-face rules handle their display.
+    Detects TOC entries dynamically — works for any PDF regardless of format:
+
+    Pattern 1  (\x08 tab marker, page 7 of this book):
+        Line text contains \\x08 — an explicit right-tab used for dot leaders.
+
+    Pattern 2  (negative-gap 2-line structure, page 8 of this book):
+        Block has ≥ 2 lines where line[1] OVERLAPS line[0] vertically
+        (gap < 2 pt) AND line[1] is a short integer (page number) positioned
+        in the right 40 % of the page.
+        Example:
+            LINE 0: "Chapter 20: Voices from the Past"   x=(53–216)
+            LINE 1: "164"                                 x=(293–311)  ← overlap
+
+    No hard-coded page numbers or heading strings — purely structural.
     """
-    parts: list[str] = []
-    all_blks = sorted(img_blks + txt_blks,
-                      key=lambda b: (round(b["bbox"][1]/5)*5, b["bbox"][0]))
+    lines = blk.get("lines", [])
+    if not lines:
+        return False
 
-    for blk in all_blks:
-        btype = blk.get("type")
+    # Pattern 1 — explicit \x08 tab
+    for ln in lines:
+        for sp in ln.get("spans", []):
+            if '\x08' in sp["text"]:
+                return True
+
+    # Pattern 2 — two overlapping lines, line[1] = right-margin page number
+    if len(lines) >= 2:
+        gap = lines[1]["bbox"][1] - lines[0]["bbox"][3]   # negative = overlap
+        if gap < 2:                                        # overlapping/touching
+            ln1_text = "".join(
+                sp["text"] for sp in lines[1].get("spans", [])
+            ).strip()
+            ln1_x0   = lines[1]["bbox"][0]
+            is_num   = ln1_text.isdigit() and 1 <= int(ln1_text) <= 9999
+            on_right = ln1_x0 > pw_pt * 0.55              # right 45 % of page
+            if is_num and on_right:
+                return True
+
+    return False
+
+
+def _render_toc_entry(blk) -> str:
+    """Render a TOC entry as:  chapter title ···· page-number (flex row)."""
+    lines = blk.get("lines", [])
+    left_html = right_html = ""
+
+    def _spans_html(spans: list) -> str:
+        out = ""
+        for sp in spans:
+            text = _fix_pua(sp["text"]).replace('\x08', '').strip()
+            if not text:
+                continue
+            c           = sp["color"]
+            bold, italic = _font_flags(sp["font"])
+            out += _span_html(
+                text, sp["font"], sp["size"],
+                (c>>16)&0xFF, (c>>8)&0xFF, c&0xFF,
+                bold, italic, include_size=True
+            )
+        return out
+
+    if lines:
+        left_html  = _spans_html(lines[0].get("spans", []))
+    if len(lines) > 1:
+        right_html = _spans_html(lines[1].get("spans", []))
+
+    if not left_html and not right_html:
+        return ""
+
+    return (f'<p style="display:flex;justify-content:space-between;'
+            f'align-items:baseline;margin:0 0 0.2em 0;">'
+            f'{left_html}'
+            f'<span style="flex:1;border-bottom:1px dotted #aaa;'
+            f'margin:0 5px 3px;"></span>'
+            f'{right_html}</p>')
+
+
+def _build_page_parts(page, pw_pt, scale, img_blks, txt_blks, page_area):
+    """Return list of semantic HTML strings for one page.
+
+    Paragraph detection
+    ───────────────────
+    PyMuPDF block = one logical unit (paragraph, TOC entry, heading, list item).
+    Lines within the SAME block are merged into one <p> when their gap is small
+    (< 60 % of line height).  Lines in DIFFERENT blocks are ALWAYS separate
+    paragraphs — this correctly keeps TOC entries, list items, etc. separate.
+
+    Why blocks matter:  a TOC has one block per chapter entry, so entries stay
+    separate.  A body paragraph has one block with many close lines, so they
+    merge into one reflowing <p>.
+
+    Semantic tags
+    ─────────────
+    Font size relative to body text → h1 / h2 / h3 / p.
+    """
+    font_css = _get_font_css(page)
+    parts: list[str] = []
+    if font_css:
+        parts.append(f'<style>{font_css}</style>')
+
+    body_sz = _body_font_size(txt_blks)
+
+    # ── Page metrics ──────────────────────────────────────────────────────
+    all_lns = [ln for blk in txt_blks for ln in blk.get("lines", [])]
+    heights  = sorted(l["bbox"][3]-l["bbox"][1]
+                      for l in all_lns if l["bbox"][3] > l["bbox"][1])
+    median_h = heights[len(heights)//2] if heights else 10
+
+    # Gap threshold: blocks closer than this → candidate for merging
+    merge_thresh = median_h * 0.6
+
+    # Right margin: the maximum x1 seen across all text lines on this page.
+    # Used to detect "short last lines" that signal a paragraph boundary.
+    right_margin = max(
+        (ln["bbox"][2]
+         for blk in txt_blks
+         for ln in blk.get("lines", [])),
+        default=pw_pt * 0.85
+    )
+    # A line ending more than 5 % of the right margin before the right edge
+    # is "short" — it is the final line of its paragraph (justified body
+    # text fills the full width on every line EXCEPT the last one).
+    # Using a percentage makes this work for any page/font size.
+    # Minimum of 10 pt to avoid hair-trigger on very narrow pages.
+    short_thresh = right_margin - max(right_margin * 0.05, 10)
+
+    # ── Walk blocks in reading order ──────────────────────────────────────
+    sorted_blks = sorted(txt_blks,
+                         key=lambda b: (round(b["bbox"][1]/2)*2, b["bbox"][0]))
+    items:     list[dict] = []
+    cur_lines: list[dict] = []   # lines accumulating for current paragraph
+    cur_bottom: float     = 0
+    prev_was_short: bool  = False  # was the last line in cur_lines "short"?
+
+    # ── Flatten blocks → individual lines, preserving TOC blocks intact ─────
+    # Process EVERY LINE individually so the short-line heuristic works even
+    # when multiple "short" lines live inside the same PyMuPDF block (e.g.
+    # a list of book titles where each title is its own paragraph).
+
+    for blk in sorted_blks:
         bx0, by0, bx1, by1 = blk["bbox"]
 
-        # ── Inline image ──────────────────────────────────────────────────────
-        if btype == 1:
-            img_w = bx1 - bx0
-            img_h = by1 - by0
-            if img_w < 12 or img_h < 12:
-                continue
-            if img_w > 0 and img_h > 0:
-                if max(img_w/img_h, img_h/img_w) > 4.0:
-                    continue
-            _mn = min(img_w, img_h)
-            if _mn > 0 and img_h * min(200.0/_mn, 4.0) > 600:
-                continue
-            if _overlaps_text(blk["bbox"], txt_blks):
-                continue
-            b64 = _render_region(page, fitz.Rect(bx0, by0, bx1, by1))
-            if b64:
-                parts.append(
-                    f'<div style="text-align:center;margin:10px 0;" '
-                    f'contenteditable="false">'
-                    f'<img src="data:image/png;base64,{b64}" '
-                    f'style="max-width:100%;height:auto;display:block;margin:0 auto;" '
-                    f'alt=""/></div>'
-                )
+        # Skip text inside an image block (already drawn as pixels)
+        if any(
+            ix0 <= bx0 and iy0 <= by0 and ix1 >= bx1 and iy1 >= by1
+            for ix0, iy0, ix1, iy1 in (b["bbox"] for b in img_blks)
+        ):
             continue
 
-        if btype != 0:
+        # TOC / standalone block → flush current paragraph, add as toc item
+        if _is_standalone_block(blk, pw_pt):
+            if cur_lines:
+                items.append({"type": "para",
+                               "y": cur_lines[0]["bbox"][1],
+                               "lines": cur_lines})
+                cur_lines = []
+            items.append({"type": "toc", "y": by0, "blk": blk, "pw_pt": pw_pt})
+            cur_bottom     = by1
+            prev_was_short = False
             continue
 
-        # ── Text block ────────────────────────────────────────────────────────
-        blk_c = _is_centered(bx0, bx1, pw_pt)
-        blk_r = (not blk_c) and _is_right(bx0, bx1, pw_pt)
+        # Process every line in this block individually
+        for ln in sorted(blk.get("lines", []), key=lambda l: l["bbox"][1]):
+            ln_dict = {"spans": ln.get("spans", []),
+                       "bbox":  ln["bbox"],
+                       "bx0": bx0, "bx1": bx1}
+            ly0, ly1 = ln["bbox"][1], ln["bbox"][3]
+            lx1      = ln["bbox"][2]
+            gap      = ly0 - cur_bottom
 
-        for line in blk.get("lines", []):
-            lx0, _, lx1, _ = line["bbox"]
-            if blk_c or _is_centered(lx0, lx1, pw_pt):
-                align = "center"
-            elif blk_r or _is_right(lx0, lx1, pw_pt):
-                align = "right"
+            # Start a new paragraph when:
+            #  1. Nothing accumulated yet
+            #  2. Gap from previous line is large (actual blank line)
+            #  3. Previous line was short (last line of a paragraph)
+            start_new = (
+                not cur_lines
+                or gap > merge_thresh
+                or prev_was_short
+            )
+
+            if start_new:
+                if cur_lines:
+                    items.append({"type": "para",
+                                   "y": cur_lines[0]["bbox"][1],
+                                   "lines": cur_lines})
+                cur_lines = [ln_dict]
             else:
-                align = "left"
+                cur_lines.append(ln_dict)
 
-            spans_html = ""
-            for sp in line.get("spans", []):
-                # Apply PUA fix: U+E000+ascii → correct ASCII character
+            prev_was_short = lx1 < short_thresh
+            cur_bottom     = ly1
+
+    if cur_lines:
+        items.append({"type": "para",
+                       "y": cur_lines[0]["bbox"][1],
+                       "lines": cur_lines})
+
+    # ── Images ────────────────────────────────────────────────────────────
+    for blk in img_blks:
+        bx0, by0, bx1, by1 = blk["bbox"]
+        items.append({"type": "img", "y": by0,
+                      "bbox": (bx0, by0, bx1, by1)})
+
+    items.sort(key=lambda x: x["y"])
+
+    # ── Render ────────────────────────────────────────────────────────────
+    seen_img_prints: set[str] = set()   # b64 fingerprints — catches duplicates
+
+    for item in items:
+
+        # ── Image ─────────────────────────────────────────────────────────
+        if item["type"] == "img":
+            bx0, by0, bx1, by1 = item["bbox"]
+            iw, ih = bx1-bx0, by1-by0
+            if iw < 12 or ih < 12:                                      continue
+            if iw > 0 and ih > 0 and max(iw/ih, ih/iw) > 4.0:          continue
+            mn = min(iw, ih)
+            if mn > 0 and ih * min(200.0/mn, 4.0) > 600:                continue
+            # Filter 1 – direct overlap
+            if _overlaps_text(item["bbox"], txt_blks, threshold=0.20):   continue
+            # Filter 2 – large background covering text area
+            if _covers_text_area(item["bbox"], txt_blks, coverage=0.30):  continue
+
+            b64 = _render_region(page, fitz.Rect(bx0, by0, bx1, by1))
+            if not b64:
+                continue
+
+            # Filter 3 – duplicate image on same page.
+            # The PDF may place the same image twice in its content stream.
+            # The first 80 base64 chars form a reliable fingerprint:
+            # identical renders always produce identical b64 prefixes.
+            fp = b64[:80]
+            if fp in seen_img_prints:
+                continue
+            seen_img_prints.add(fp)
+
+            parts.append(
+                f'<figure class="pdf-img-block" contenteditable="false" '
+                f'style="text-align:center;margin:1.2em 0;position:relative;'
+                f'cursor:pointer;">'
+                f'<img src="data:image/png;base64,{b64}" '
+                f'style="max-width:100%;height:auto;display:block;margin:0 auto;" '
+                f'alt="" draggable="false"/></figure>'
+            )
+            continue
+
+        # ── TOC entry ─────────────────────────────────────────────────────
+        if item["type"] == "toc":
+            html_row = _render_toc_entry(item["blk"])
+            if html_row:
+                parts.append(html_row)
+            continue
+
+        # ── Paragraph / Heading ───────────────────────────────────────────
+        lines = item["lines"]
+
+        # Representative font size = max span size in paragraph
+        para_max_sz = max(
+            (sp["size"] for ln in lines for sp in ln["spans"] if sp["text"].strip()),
+            default=body_sz
+        )
+
+        # Alignment from full paragraph bounding box
+        all_x0 = min(l["bbox"][0] for l in lines)
+        all_x1 = max(l["bbox"][2] for l in lines)
+        if _is_centered(all_x0, all_x1, pw_pt):
+            align = "center"
+        elif _is_right(all_x0, all_x1, pw_pt):
+            align = "right"
+        else:
+            align = "left"
+
+        # Decide tag — only single-line blocks with large ratio become headings
+        htag = _heading_tag(para_max_sz, body_sz, len(lines))
+        tag  = htag if htag else "p"
+
+        # Build inner HTML — use semantic <strong>/<em> per pdf-to-epub skill
+        # Collect all raw span data first, then merge adjacent identical styles
+        raw_spans: list[dict] = []
+        for ln in lines:
+            for sp in ln["spans"]:
                 text = _fix_pua(sp["text"])
                 if not text:
                     continue
-                sz   = sp["size"]
-                font = sp["font"]
-                c    = sp["color"]
-                r, g, b = (c>>16)&0xFF, (c>>8)&0xFF, c&0xFF
-                bold, italic = _font_flags(font)
-                style = (f"font-size:{sz:.1f}pt;"
-                         f"font-family:'{font}',serif;"
-                         f"color:rgb({r},{g},{b});")
-                if bold:   style += "font-weight:bold;"
-                if italic: style += "font-style:italic;"
-                safe = (text.replace("&","&amp;")
-                            .replace("<","&lt;")
-                            .replace(">","&gt;"))
-                spans_html += f'<span style="{style}">{safe}</span>'
+                c = sp["color"]
+                bold, italic = _font_flags(sp["font"])
+                raw_spans.append({
+                    "text":   text,
+                    "font":   sp["font"],
+                    "size":   sp["size"],
+                    "r": (c>>16)&0xFF, "g": (c>>8)&0xFF, "b": c&0xFF,
+                    "bold":   bold,
+                    "italic": italic,
+                })
+            # Paragraph line separator (flow layout — joins with space)
+            if raw_spans and not raw_spans[-1]["text"].endswith(" "):
+                raw_spans.append(None)   # sentinel = space between lines
 
-            if spans_html.strip():
-                parts.append(
-                    f'<div style="text-align:{align};line-height:1.6;'
-                    f'margin:1px 0;overflow-wrap:break-word;">'
-                    f'{spans_html}</div>'
-                )
+        # Merge adjacent spans with identical style (pdf-to-epub: no redundant spans)
+        merged: list[dict] = []
+        for sp in raw_spans:
+            if sp is None:
+                if merged:
+                    merged[-1]["text"] += " "
+                continue
+            if (merged and
+                    merged[-1]["font"]   == sp["font"] and
+                    merged[-1]["size"]   == sp["size"] and
+                    merged[-1]["r"]      == sp["r"]    and
+                    merged[-1]["bold"]   == sp["bold"] and
+                    merged[-1]["italic"] == sp["italic"]):
+                merged[-1]["text"] += sp["text"]
+            else:
+                merged.append(dict(sp))
+
+        inner = "".join(
+            _span_html(s["text"], s["font"], s["size"],
+                       s["r"], s["g"], s["b"],
+                       s["bold"], s["italic"],
+                       include_size=(htag is None))
+            for s in merged
+            if s["text"].strip()
+        )
+
+        if inner.strip():
+            parts.append(f'<{tag} style="text-align:{align};">{inner}</{tag}>')
 
     return parts
 
@@ -214,20 +543,17 @@ def _build_page_parts(page, pw_pt, scale, img_blks, txt_blks, page_area):
 # ── Main converter ────────────────────────────────────────────────────────────
 
 def pdf_to_html(pdf_bytes: bytes) -> str:
-    """Convert PDF to editable HTML.
+    """Convert PDF to reflowable semantic HTML (EPUB-ready).
 
-    Font strategy
-    ─────────────
-    1. Call get_text("html") once per page to harvest @font-face rules.
-    2. Deduplicate the rules across all pages.
-    3. Emit ONE <style> block at the very top of the output — OUTSIDE every
-       contenteditable div — so browsers apply the embedded fonts.
-    4. Each text span references its PDF font name; the @font-face rule
-       provides the matching glyph data including PUA code point mappings.
+    • One white card per PDF page (natural height — no fixed A4)
+    • h1/h2/h3 detected from font-size ratio relative to body text
+    • Paragraphs grouped by vertical gap (empty line = new paragraph)
+    • Images inline as <figure class="pdf-img-block">
+    • Font subsets embedded via a single <style> block at the top
     """
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     pages_html: list[str] = []
-    all_font_rules: set[str] = set()   # deduplicated @font-face rules
+    all_font_rules: set[str] = set()
 
     for page_num, page in enumerate(doc):
         try:
@@ -236,7 +562,7 @@ def pdf_to_html(pdf_bytes: bytes) -> str:
             pw_px = pw_pt * 96.0/72.0
             scale = RENDER_WIDTH / pw_px
 
-            # Harvest font CSS for this page
+            # Harvest @font-face rules
             css = _get_font_css(page)
             if css:
                 for rule in re.findall(r"@font-face\s*\{[^}]+\}", css, re.DOTALL):
@@ -256,57 +582,38 @@ def pdf_to_html(pdf_bytes: bytes) -> str:
                 for sp in ln.get("spans", [])
             )
             page_area = pw_pt * ph_pt
-            img_area  = sum(
-                (b["bbox"][2]-b["bbox"][0])*(b["bbox"][3]-b["bbox"][1])
-                for b in img_blks
-            )
-            img_cov = img_area/page_area if page_area > 0 else 0
+            img_area  = sum((b["bbox"][2]-b["bbox"][0])*(b["bbox"][3]-b["bbox"][1])
+                            for b in img_blks)
+            img_cov   = img_area / page_area if page_area > 0 else 0
 
-            # Cover / full-bleed art pages
+            # Cover / full-bleed art pages → single rendered image
             if total_chars < 120 and img_cov > 0.35:
                 b64    = _render_full_page(page, scale)
-                ph_px2 = max(ph_pt * 96.0/72.0 * scale, A4_MIN_H)
+                ph_px2 = ph_pt * 96.0/72.0 * scale
                 page_html = (
-                    f'<div style="width:{RENDER_WIDTH}px;min-height:{A4_MIN_H}px;'
-                    f'margin:0 auto 32px;background:#fff;'
-                    f'box-shadow:0 2px 16px rgba(0,0,0,0.18);">'
+                    f'<div class="pdf-page" style="padding:0;">'
                     f'<img src="data:image/png;base64,{b64}" '
-                    f'style="width:{RENDER_WIDTH}px;height:{ph_px2:.0f}px;'
-                    f'display:block;" alt=""/></div>'
+                    f'style="width:100%;height:auto;display:block;" alt=""/></div>'
                 )
             else:
                 parts = _build_page_parts(
-                    page, pw_pt, scale, img_blks, txt_blks, page_area
-                )
+                    page, pw_pt, scale, img_blks, txt_blks, page_area)
                 page_html = (
-                    f'<div contenteditable="true" '
-                    f'style="width:{RENDER_WIDTH}px;min-height:{A4_MIN_H}px;'
-                    f'padding:60px 56px;background:#fff;'
-                    f'margin:0 auto 32px;'
-                    f'box-shadow:0 2px 16px rgba(0,0,0,0.18);'
-                    f'box-sizing:border-box;outline:none;'
-                    f'font-family:serif;overflow-wrap:break-word;'
-                    f'word-break:break-word;">'
+                    f'<div class="pdf-page" contenteditable="true">'
                     + "".join(parts)
                     + "</div>"
                 )
 
         except Exception as exc:
             page_html = (
-                f'<div style="width:{RENDER_WIDTH}px;height:80px;'
-                f'margin:0 auto 32px;background:#fff8f8;'
-                f'border:1px solid #f88;display:flex;align-items:center;'
-                f'justify-content:center;font-family:sans-serif;color:#c00;'
-                f'font-size:13px;">'
-                f'Page {page_num+1} could not be rendered: {exc}</div>'
+                f'<div class="pdf-page" style="color:#c00;font-family:sans-serif;">'
+                f'Page {page_num+1} error: {exc}</div>'
             )
 
         pages_html.append(page_html)
 
     doc.close()
 
-    # Single <style> block at the top — OUTSIDE all contenteditable divs
-    # so browsers actually process and apply the embedded @font-face rules.
     font_block = ""
     if all_font_rules:
         font_block = "<style>\n" + "\n".join(all_font_rules) + "\n</style>\n"
